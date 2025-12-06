@@ -502,6 +502,18 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
+        "--sketch_adapter_path",
+        type=str,
+        default=None,
+        help="Path or model id for the pretrained sketch T2IAdapter.",
+    )
+    parser.add_argument(
+        "--depth_adapter_path",
+        type=str,
+        default=None,
+        help="Path or model id for the pretrained depth T2IAdapter.",
+    )
+    parser.add_argument(
         "--image_column", type=str, default="image", help="The column of the dataset containing the target image."
     )
     parser.add_argument(
@@ -928,13 +940,21 @@ def main(args):
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
     )
 
-    if args.adapter_model_name_or_path:
+    if args.sketch_adapter_path is not None and args.depth_adapter_path is not None:
+        logger.info("Loading sketch and depth adapters for GatedMultiAdapter.")
+        sketch_adapter = T2IAdapter.from_pretrained(args.sketch_adapter_path)
+        depth_adapter = T2IAdapter.from_pretrained(args.depth_adapter_path)
+        t2iadapter = GatedMultiAdapter(
+            adapters=[sketch_adapter, depth_adapter],
+            hidden_dim=128,
+        )
+    elif args.adapter_model_name_or_path:
         logger.info("Loading existing adapter weights.")
-        t2iadapter = GatedMultiAdapter.from_pretrained(args.adapter_model_name_or_path)
+        t2iadapter = T2IAdapter.from_pretrained(args.adapter_model_name_or_path)
     else:
         raise ValueError(
-            "For GatedMultiAdapter training you must provide "
-            "--adapter_model_name_or_path pointing to a directory with pre-trained adapters."
+            "You must pass either --sketch_adapter_path + --depth_adapter_path (for GatedMultiAdapter) "
+            "or --adapter_model_name_or_path (for a single adapter)."
         )
     if not isinstance(t2iadapter, GatedMultiAdapter):
         raise ValueError(
