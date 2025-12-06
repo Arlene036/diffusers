@@ -44,4 +44,4 @@ num_inference_steps=30,
 adapter_conditioning_scale=control_weights,
 guidance_scale=7.5,
 ).images[0]
-gen_images.save('out_mid_GMA1.png')
+gen_images.save('out_mid_GMA_precomputed.png')

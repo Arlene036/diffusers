@@ -154,12 +154,19 @@ class GatedMultiAdapter(ModelMixin):
         timestep: scalar or (B,)
         """
         B = adapter_outputs[0][0].shape[0]
+        ref_feat = adapter_outputs[0][0]  # for device/dtype
 
+        # Normalize timestep to tensor (B,1)
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor(timestep, device=ref_feat.device)
+        # scalar -> expand to (B,1)
         if timestep.dim() == 0:
-            t = timestep.view(1).expand(B)
+            t = timestep.view(1).expand(B).to(ref_feat.dtype)
+        elif timestep.dim() == 1 and timestep.shape[0] == B:
+            # batch -> (B,1)
+            t = timestep.to(device=ref_feat.device, dtype=ref_feat.dtype).view(B, 1)
         else:
-            t = timestep
-        t = t.view(B, 1).to(adapter_outputs[0][0].dtype)
+            raise ValueError(f"timestep shape must be () or (B,), got {timestep.shape}")
 
         fused_outputs = []
         num_scales = len(adapter_outputs[0])
@@ -170,22 +177,22 @@ class GatedMultiAdapter(ModelMixin):
             gate_logit_list = []
 
             for i in range(self.num_adapter):
-                m_i_k = adapter_outputs[i][k]  # (B,Ck,Hk,Wk)
+                m_i_k = adapter_outputs[i][k]  # (B,C_k,H_k,W_k)
                 C_k = m_i_k.shape[1]
 
-                pooled = m_i_k.mean(dim=(2,3))
-                cond = torch.cat([pooled, t], dim=1)
+                pooled = m_i_k.mean(dim=(2,3)) # (B, C_k)
+                cond = torch.cat([pooled, t], dim=1) # (B, C_k + 1)
 
                 film_out = self.film_mlps[k](cond)
                 gamma_k_i, beta_k_i = torch.split(film_out, C_k, dim=-1)
                 gamma_k_i = gamma_k_i.view(B, C_k, 1, 1)
                 beta_k_i = beta_k_i.view(B, C_k, 1, 1)
-
                 gamma_list.append(gamma_k_i)
                 beta_list.append(beta_k_i)
+
                 gate_logit_list.append(self.gate_mlps[k](cond))
 
-            alpha_k = torch.softmax(torch.cat(gate_logit_list, dim=1), dim=1)
+            alpha_k = torch.softmax(torch.cat(gate_logit_list, dim=1), dim=1) # (B, num_adapter)
 
             fused_k = 0
             for i in range(self.num_adapter):
