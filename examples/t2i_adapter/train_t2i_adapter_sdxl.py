@@ -47,7 +47,6 @@ from diffusers import (
     StableDiffusionXLAdapterPipeline,
     T2IAdapter,
     UNet2DConditionModel,
-    EulerAncestralDiscreteScheduler
 )
 from diffusers.models.adapter import GatedMultiAdapter
 from diffusers.optimization import get_scheduler
@@ -67,8 +66,6 @@ check_min_version("0.36.0.dev0")
 
 logger = get_logger(__name__)
 
-model_id = 'stabilityai/stable-diffusion-xl-base-1.0'
-scheduler = EulerAncestralDiscreteScheduler.from_pretrained(model_id, subfolder="scheduler")
 
 def image_grid(imgs, rows, cols):
     assert len(imgs) == rows * cols
@@ -81,10 +78,10 @@ def image_grid(imgs, rows, cols):
     return grid
 
 
-def log_validation0(vae, unet, adapter, args, accelerator, weight_dtype, step):
+def log_validation(vae, unet, adapter, args, accelerator, weight_dtype, step):
     logger.info("Running validation... ")
 
-    # adapter = accelerator.unwrap_model(adapter)
+    adapter = accelerator.unwrap_model(adapter)
 
     pipeline = StableDiffusionXLAdapterPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -164,6 +161,11 @@ def log_validation0(vae, unet, adapter, args, accelerator, weight_dtype, step):
 
                 formatted_images.append(wandb.Image(validation_image, caption="adapter conditioning"))
 
+                for image in images:
+                    image = wandb.Image(image, caption=validation_prompt)
+                    formatted_images.append(image)
+
+            tracker.log({"validation": formatted_images})
         else:
             logger.warning(f"image logging not implemented for {tracker.name}")
 
@@ -172,104 +174,6 @@ def log_validation0(vae, unet, adapter, args, accelerator, weight_dtype, step):
         torch.cuda.empty_cache()
 
         return image_logs
-
-def log_validation(vae, unet, adapter, args, accelerator, weight_dtype, step, val_dataset):
-    logger.info("Running validation... ")
-    negative_prompt = "anime, cartoon, graphic, text, painting, crayon, graphite, abstract, glitch, deformed, mutated, ugly, disfigured"
-
-    adapter_for_val = accelerator.unwrap_model(adapter)
-    adapter_for_val = adapter_for_val.to(accelerator.device, dtype=weight_dtype)
-    pipeline = StableDiffusionXLAdapterPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        vae=vae,
-        unet=unet,
-        scheduler=scheduler,
-        adapter=adapter_for_val,
-        revision=args.revision,
-        variant="fp16",
-        torch_dtype=weight_dtype, # fp16
-    ).to(accelerator.device)
-    pipeline.set_progress_bar_config(disable=True)
-
-    if args.enable_xformers_memory_efficient_attention:
-        pipeline.enable_xformers_memory_efficient_attention()
-
-    # ------------------------------
-    # 使用 dataset，而不是 args.validation_image
-    # 取前 N 个样本作为 validation demo
-    # ------------------------------
-    num_samples = min(4, len(val_dataset))
-
-    image_logs = []
-
-    for i in range(num_samples):
-        sample = val_dataset[i]
-
-        img = sample[args.image_column].convert("RGB").resize((args.resolution, args.resolution))
-        sketch = sample[args.sketch_image_column].convert("RGB").resize((args.resolution, args.resolution))
-        depth = sample[args.depth_image_column].convert("RGB").resize((args.resolution, args.resolution))
-
-        prompt = sample.get(args.caption_column, "")
-
-        result_entry = {
-            "prompt": prompt,
-            "conditioning_original": wandb.Image(img, caption="original"),
-            "conditioning_sketch": wandb.Image(sketch, caption="sketch"),
-            "conditioning_depth": wandb.Image(depth, caption="depth"),
-            "samples": {}
-        }
-
-        # ----------------------------
-        #  对每个 timestep 生成图
-        # ----------------------------
-        for t in args.validation_timesteps:
-            timestep_images = []
-            
-            with torch.no_grad():
-                out = pipeline(
-                    prompt=prompt,
-                    negative_prompt=negative_prompt,
-                    image=[depth, sketch], # [sketch, depth],
-                    num_inference_steps=t,
-                    guidance_scale=7.5,
-                ).images[0]
-
-            timestep_images.append(wandb.Image(out, caption=f"t={t}"))
-
-            result_entry["samples"][f"timestep_{t}"] = timestep_images
-
-        image_logs.append(result_entry)
-
-    # ---------------------------------
-    # 🔥 WandB logging（最小改动）
-    # ---------------------------------
-    for tracker in accelerator.trackers:
-        if tracker.name == "wandb":
-            wandb_logs = {}
-
-            for log in image_logs:
-
-                # Merge outputs by timestep
-                for t_key, images in log["samples"].items():
-                    key = f"val/{t_key}"
-                    if key not in wandb_logs:
-                        wandb_logs[key] = []
-                    wandb_logs[key].extend(images)
-
-                # Add conditioning images
-                for cond_key in ["conditioning_original", "conditioning_sketch", "conditioning_depth"]:
-                    key = f"val/{cond_key}"
-                    if key not in wandb_logs:
-                        wandb_logs[key] = []
-                    wandb_logs[key].append(log[cond_key])
-
-            tracker.log(wandb_logs)
-
-    del pipeline
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    return image_logs
 
 
 def import_model_class_from_model_name_or_path(
@@ -509,18 +413,6 @@ def parse_args(input_args=None):
         default=1,
         help=("Number of subprocesses to use for data loading."),
     )
-    parser.add_argument(
-        "--validation_timesteps",
-        type=int,
-        nargs="+",
-        default=[5, 10, 20, 30],
-        help="Timestep list for multi-step validation sampling."
-    )
-    parser.add_argument(
-        "--GMA_temperature",
-        type=float,
-        default=5.0
-    )
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
     parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
@@ -627,7 +519,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--conditioning_image_column",
         type=str,
-        default=None,
+        default="conditioning_image",
         help="The column of the dataset containing the adapter conditioning image.",
     )
     parser.add_argument(
@@ -753,7 +645,7 @@ def parse_args(input_args=None):
     return args
 
 
-def get_datasets(args, accelerator):
+def get_train_dataset(args, accelerator):
     # Get the datasets: you can either provide your own training and evaluation files (see below)
     # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
 
@@ -777,8 +669,7 @@ def get_datasets(args, accelerator):
 
     # Preprocessing the datasets.
     # We need to tokenize inputs and targets.
-    column_names = dataset["val"].column_names
-    print(column_names)
+    column_names = dataset["train"].column_names
 
     # 6. Get the column names for input/target.
     if args.image_column is None:
@@ -826,16 +717,10 @@ def get_datasets(args, accelerator):
             )
 
     with accelerator.main_process_first():
-        full_dataset = dataset["val"]
-        # NOT SHUFFLE HERE
-        total_len = len(full_dataset)
-
-        train_cut = int(total_len * 0.9)
-        train_dataset = full_dataset.select(range(train_cut))                   # 0 : 4499
-        val_dataset = full_dataset.select(range(train_cut, total_len))          # 4500 : 4999
+        train_dataset = dataset["train"].shuffle(seed=args.seed)
         if args.max_train_samples is not None:
-            train_dataset = train_dataset.select(range(min(args.max_train_samples, len(train_dataset))))
-    return train_dataset, val_dataset
+            train_dataset = train_dataset.select(range(args.max_train_samples))
+    return train_dataset
 
 
 # Adapted from pipelines.StableDiffusionXLPipeline.encode_prompt
@@ -879,7 +764,7 @@ def encode_prompt(prompt_batch, text_encoders, tokenizers, proportion_empty_prom
     return prompt_embeds, pooled_prompt_embeds
 
 
-def prepare_dataset(dataset, accelerator):
+def prepare_train_dataset(dataset, accelerator):
     image_transforms = transforms.Compose(
         [
             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
@@ -975,34 +860,6 @@ def main(args):
         project_config=accelerator_project_config,
     )
 
-    # wandb init
-    # compute effective batch size
-    effective_bs = (
-        args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-    )
-
-    # custom wandb run name
-    run_name = (
-        f"sdxl_nonsep_timeembed_res{args.resolution}_"
-        f"lr{args.learning_rate}_"
-        f"bs{effective_bs}_Film"
-    )
-
-    accelerator.init_trackers(
-        project_name=args.tracker_project_name if hasattr(args, "tracker_project_name") else "t2i_adapter_sdxl",
-        config={
-            "resolution": args.resolution,
-            "learning_rate": args.learning_rate,
-            "batch_size": effective_bs,
-        },
-        init_kwargs={
-            "wandb": {
-                "name": run_name
-            }
-        },
-    )
-
-
     # Disable AMP for MPS.
     if torch.backends.mps.is_available():
         accelerator.native_amp = False
@@ -1090,7 +947,6 @@ def main(args):
         t2iadapter = GatedMultiAdapter(
             adapters=[sketch_adapter, depth_adapter],
             hidden_dim=128,
-            enable_film=True,
         )
         t2iadapter = t2iadapter.to(accelerator.device)
         for base in t2iadapter.adapters:
@@ -1145,8 +1001,8 @@ def main(args):
                 load_dir = os.path.join(input_dir, "t2iadapter")
                 load_model = type(model).from_pretrained(load_dir)
 
-                # if args.control_type != "style":
-                #     model.register_to_config(**load_model.config)
+                if args.control_type != "style":
+                    model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
                 del load_model
@@ -1171,10 +1027,8 @@ def main(args):
         # fallback – original behaviour
         t2iadapter.requires_grad_(True)
 
-    unet.requires_grad_(False)
-    unet.eval()
     t2iadapter.train()
-    # unet.train()
+    unet.train()
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -1239,38 +1093,35 @@ def main(args):
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
-    # # --- Warm-up GatedMultiAdapter MLPs so they exist before creating optimizer ---
-    # if isinstance(t2iadapter, GatedMultiAdapter) and not t2iadapter._mlp_inited:
-    #     dummy_H = args.resolution
-    #     dummy_W = args.resolution
-    #     in_ch = t2iadapter.adapters[0].in_channels  # usually 3
-    #     dummy_timestep = torch.tensor(1, device=accelerator.device)
-    #     dummy = torch.zeros(
-    #         1,
-    #         in_ch,
-    #         dummy_H,
-    #         dummy_W,
-    #         device=accelerator.device,
-    #         dtype=next(t2iadapter.parameters()).dtype,
-    #     )
-    #     # one dummy input per adapter
-    #     dummy_list = [dummy for _ in range(t2iadapter.num_adapter)]
-    #     # this will internally call _init_mlps_from_features(...)
-    #     with torch.no_grad():
-    #         _ = t2iadapter.forward(dummy_list, dummy_timestep)
+    # --- Warm-up GatedMultiAdapter MLPs so they exist before creating optimizer ---
+    if isinstance(t2iadapter, GatedMultiAdapter) and not t2iadapter._mlp_inited:
+        dummy_H = args.resolution
+        dummy_W = args.resolution
+        in_ch = t2iadapter.adapters[0].in_channels  # usually 3
+
+        dummy = torch.zeros(
+            1,
+            in_ch,
+            dummy_H,
+            dummy_W,
+            device=accelerator.device,
+            dtype=weight_dtype,
+        )
+        # one dummy input per adapter
+        dummy_list = [dummy for _ in range(t2iadapter.num_adapter)]
+        # this will internally call _init_mlps_from_features(...)
+        with torch.no_grad():
+            _ = t2iadapter.forward_static(dummy_list)
 
 
     # Optimizer creation
     if isinstance(t2iadapter, GatedMultiAdapter):
-        # assert t2iadapter._mlp_inited == True
+        assert t2iadapter._mlp_inited == True
         params_to_optimize = []
         for mlp in t2iadapter.film_mlps:
             params_to_optimize += list(mlp.parameters())
         for mlp in t2iadapter.gate_mlps:
             params_to_optimize += list(mlp.parameters())
-        params_to_optimize += list(t2iadapter.time_proj.parameters())
-        params_to_optimize += list(t2iadapter.time_emb.parameters())
-
 
         # Make sure nothing else is trainable
         for p in t2iadapter.adapters.parameters():
@@ -1291,7 +1142,7 @@ def main(args):
     if args.pretrained_vae_model_name_or_path is not None:
         vae.to(accelerator.device, dtype=weight_dtype)
     else:
-        vae.to(accelerator.device, dtype=torch.float16)
+        vae.to(accelerator.device, dtype=torch.float32)
     unet.to(accelerator.device, dtype=weight_dtype)
     text_encoder_one.to(accelerator.device, dtype=weight_dtype)
     text_encoder_two.to(accelerator.device, dtype=weight_dtype)
@@ -1337,7 +1188,7 @@ def main(args):
     # from memory.
     text_encoders = [text_encoder_one, text_encoder_two]
     tokenizers = [tokenizer_one, tokenizer_two]
-    train_dataset, val_dataset = get_datasets(args, accelerator)
+    train_dataset = get_train_dataset(args, accelerator)
     compute_embeddings_fn = functools.partial(
         compute_embeddings,
         proportion_empty_prompts=args.proportion_empty_prompts,
@@ -1351,21 +1202,12 @@ def main(args):
         # details: https://github.com/huggingface/diffusers/pull/4038#discussion_r1266078401
         new_fingerprint = Hasher.hash(args)
         train_dataset = train_dataset.map(compute_embeddings_fn, batched=True, new_fingerprint=new_fingerprint)
-        val_dataset = val_dataset.map(compute_embeddings_fn, batched=True, new_fingerprint=new_fingerprint)
 
     # Then get the training dataset ready to be passed to the dataloader.
-    train_dataset = prepare_dataset(train_dataset, accelerator)
-    val_dataset = prepare_dataset(val_dataset, accelerator)
+    train_dataset = prepare_train_dataset(train_dataset, accelerator)
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
-        shuffle=True,
-        collate_fn=collate_fn,
-        batch_size=args.train_batch_size,
-        num_workers=args.dataloader_num_workers,
-    )
-    val_dataloader = torch.utils.data.DataLoader(
-        val_dataset,
         shuffle=True,
         collate_fn=collate_fn,
         batch_size=args.train_batch_size,
@@ -1392,13 +1234,6 @@ def main(args):
     t2iadapter, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         t2iadapter, optimizer, train_dataloader, lr_scheduler
     )
-
-    if accelerator.is_main_process:
-        trainable = sum(
-            p.numel() for p in t2iadapter.parameters() if p.requires_grad
-        )
-        logger.info(f"Total trainable params in t2iadapter after prepare = {trainable}")
-
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1460,7 +1295,6 @@ def main(args):
     else:
         initial_global_step = 0
 
-
     progress_bar = tqdm(
         range(0, args.max_train_steps),
         initial=initial_global_step,
@@ -1476,7 +1310,7 @@ def main(args):
                 if args.pretrained_vae_model_name_or_path is not None:
                     pixel_values = batch["pixel_values"].to(dtype=weight_dtype)
                 else:
-                    pixel_values = batch["pixel_values"].to(dtype=torch.float16)
+                    pixel_values = batch["pixel_values"]
 
                 # encode pixel values with batch size of at most 8 to avoid OOM
                 latents = []
@@ -1520,30 +1354,12 @@ def main(args):
                     sample.to(dtype=weight_dtype) for sample in down_block_additional_residuals
                 ]
 
-                if accelerator.is_main_process and global_step == 0 and isinstance(t2iadapter, GatedMultiAdapter):
-                    req_grads = [res.requires_grad for res in down_block_additional_residuals]
-                    logger.info(f"down_block_additional_residuals.requires_grad per scale: {req_grads}")
-
-
-                # Predict the noise residual
-                # Ensure text embeddings & added conds match UNet dtype (weight_dtype)
-                encoder_hidden_states = batch["prompt_ids"].to(
-                    device=inp_noisy_latents.device, dtype=weight_dtype
-                )
-
-                added_cond_kwargs = {}
-                for k, v in batch["unet_added_conditions"].items():
-                    if isinstance(v, torch.Tensor):
-                        added_cond_kwargs[k] = v.to(device=inp_noisy_latents.device, dtype=weight_dtype)
-                    else:
-                        added_cond_kwargs[k] = v  # just in case there are non-tensor entries
-
                 # Predict the noise residual
                 model_pred = unet(
                     inp_noisy_latents,
                     timesteps,
-                    encoder_hidden_states=encoder_hidden_states,
-                    added_cond_kwargs=added_cond_kwargs,
+                    encoder_hidden_states=batch["prompt_ids"],
+                    added_cond_kwargs=batch["unet_added_conditions"],
                     down_block_additional_residuals=down_block_additional_residuals,
                     return_dict=False,
                 )[0]
@@ -1570,20 +1386,11 @@ def main(args):
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     if isinstance(t2iadapter, GatedMultiAdapter):
-                        params_to_clip = list(t2iadapter.film_mlps.parameters()) + \
-                                            list(t2iadapter.gate_mlps.parameters())
+                        params_to_clip = list(t2iadapter.film_mlps.parameters()) + list(
+                            t2iadapter.gate_mlps.parameters())
                     else:
                         params_to_clip = t2iadapter.parameters()
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-                
-                # if isinstance(t2iadapter, GatedMultiAdapter) and accelerator.sync_gradients and accelerator.is_main_process:
-                #     if global_step % 10 == 0:
-                #         for n, p in t2iadapter.named_parameters():
-                #             if p.requires_grad:
-                #                 if p.grad is None:
-                #                     logger.info(f"[DEBUG] {n}: grad=None")
-                #                 else:
-                #                     logger.info(f"[DEBUG] {n}: grad_norm={p.grad.data.norm().item():.4e}")
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=args.set_grads_to_none)
@@ -1628,7 +1435,6 @@ def main(args):
                             accelerator,
                             weight_dtype,
                             global_step,
-                            val_dataset
                         )
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
@@ -1642,8 +1448,7 @@ def main(args):
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         t2iadapter = unwrap_model(t2iadapter)
-        sub_dir = "t2iadapter"
-        t2iadapter.save_pretrained(os.path.join(args.output_dir, sub_dir))
+        t2iadapter.save_pretrained(args.output_dir)
 
         if args.push_to_hub:
             save_model_card(
