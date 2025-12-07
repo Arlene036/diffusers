@@ -47,6 +47,7 @@ import torch.nn as nn
 from ..configuration_utils import ConfigMixin, register_to_config
 from ..utils import logging
 from .modeling_utils import ModelMixin
+from diffusers.models.embeddings import GaussianFourierProjection, TimestepEmbedding
 
 
 logger = logging.get_logger(__name__)
@@ -64,8 +65,20 @@ class GatedMultiAdapter(ModelMixin):
             A list of `T2IAdapter` model instances.
     """
 
-    def __init__(self, adapters: List["T2IAdapter"], hidden_dim: int = 128, enable_film: bool = True):
+    def __init__(self, adapters: List["T2IAdapter"], hidden_dim: int = 128, enable_film: bool = True, time_embed_dim=256):
         super(GatedMultiAdapter, self).__init__()
+
+        self.time_embed_dim = time_embed_dim
+        self.time_proj = GaussianFourierProjection()   # maps scalar → sin/cos features
+        fourier_dim = self.time_proj.embedding_size * 2      # usually 256
+        
+        self.time_emb = TimestepEmbedding(
+            in_channels=fourier_dim,
+            time_embed_dim=time_embed_dim,  # final embedding dim
+        )
+
+        self.time_proj.requires_grad_(True)
+        self.time_emb.requires_grad_(True)
 
         self.num_adapter = len(adapters)
         self.adapters = nn.ModuleList(adapters)
@@ -106,17 +119,15 @@ class GatedMultiAdapter(ModelMixin):
         self.hidden_dim = hidden_dim
         self.film_mlps = nn.ModuleList()  # len = num_scales (default = 4 len of channels) channels: List[int] = [320, 640, 1280, 1280], seen in T2I-adapter
         self.gate_mlps = nn.ModuleList()
-        self._mlp_inited = False
+        self._init_mlps_from_features()
     
-    def _init_mlps_from_features(self, adapter_outputs):
-        first_adapter_feats = adapter_outputs[0]  # list of 4 scales
-        num_scales = len(first_adapter_feats)
-
-        for k in range(num_scales):
-            C_k = first_adapter_feats[k].shape[1]  # channel size, 如320 (4个channel分别是[320, 640, 1280, 1280])
-            assert C_k in [320, 640, 1280, 1280]
-
-            in_dim = C_k + 1  # pooled feature + timestep
+    def _init_mlps_from_features(self):
+        # first_adapter_feats = adapter_outputs[0]  # list of 4 scales
+        # num_scales = len(first_adapter_feats)
+        channels = [320, 640, 1280, 1280]
+        for k in range(4):
+            C_k = channels[k]
+            in_dim = C_k + self.time_embed_dim # pooled feature + timestep
 
             # FiLM_k
             film_mlp_k = nn.Sequential(
@@ -143,7 +154,6 @@ class GatedMultiAdapter(ModelMixin):
             self.film_mlps.append(film_mlp_k)
             self.gate_mlps.append(gate_mlp_k)
 
-        self._mlp_inited = True
 
     def forward(self, xs: torch.Tensor, timestep: torch.Tensor) -> List[torch.Tensor]:
         r"""
@@ -165,13 +175,13 @@ class GatedMultiAdapter(ModelMixin):
 
         for i, adapter in enumerate(self.adapters):
             x_i = xs[i]        # shape (B, C, H, W)
+            ref_param = next(adapter.parameters())
+            x_i = x_i.to(device=ref_param.device, dtype=ref_param.dtype)
             feats_i = adapter(x_i)   # list of 4 tensors (B, Ck, Hk, Wk)
             adapter_outputs.append(feats_i)
-        # =====init mlps=====
-        if not self._mlp_inited:
-            self._init_mlps_from_features(adapter_outputs)
-        
+
         device = xs[0].device
+        
         self.film_mlps.to(device)
         self.gate_mlps.to(device)
         self.adapters.to(device)
@@ -184,16 +194,22 @@ class GatedMultiAdapter(ModelMixin):
 
         # ======prepare timestep embedding=====
         if timestep.dim() == 0:
-            t = timestep.view(1).expand(B)
+            t = timestep[None].expand(B)
         else:
             t = timestep
-        t = t.view(B, 1).to(dtype) 
+
+        t = t.to(device=xs[0].device, dtype=xs[0].dtype)
+
+        # ===== UNet timestep embedding =====
+        t_proj = self.time_proj(t)     # (B, fourier_dim)
+        t_embed = self.time_emb(t_proj)  # (B, time_embed_dim)
 
 
         # =====FiLM + gating========
         fused_outputs = []
         num_channels = len(adapter_outputs[0]) # 4
 
+        all_weights = []
         for k in range(num_channels):
             # 对每一个channel，独立做FiLM和gating；
             # i: 不同adapter
@@ -207,7 +223,8 @@ class GatedMultiAdapter(ModelMixin):
                 C_k = m_i_k.shape[1] # channel size
 
                 pooled = m_i_k.mean(dim=(2,3)) # (B, Ck)
-                cond = torch.cat([pooled, t], dim = 1)
+                cond = torch.cat([pooled, t_embed], dim=1)
+                cond = cond.to(dtype=self.film_mlps[k][0].weight.dtype)
                 
                 # film
                 film_out = self.film_mlps[k](cond) # shape = (B, 2*C_k)
@@ -226,6 +243,15 @@ class GatedMultiAdapter(ModelMixin):
             gate_logits_k = torch.cat(gate_logit_list, dim=1)
             alpha_k = torch.softmax(gate_logits_k, dim=1)  # (B, num_adapter)
 
+            # ----- DEBUG PRINT GATE WEIGHTS -----
+            if (not self.training) or (torch.rand(1).item() < 0.1):
+                t_int = int(timestep[0].item()) if timestep.dim() > 0 else int(timestep.item())
+                weights = alpha_k[0].detach().cpu().numpy().tolist()
+                print(f"[GATE] t={t_int}, scale={k}, weights={weights}, sum={sum(weights):.4f}")
+            # ------------------------------------
+            all_weights.append(alpha_k.detach().cpu())
+
+
             # >> fuse modalities at this channel
             fused_k = 0
             for i in range(self.num_adapter):
@@ -241,6 +267,7 @@ class GatedMultiAdapter(ModelMixin):
                 fused_k = fused_k + w_i * modulated
 
             fused_outputs.append(fused_k)
+            self.last_gate_weights = all_weights
 
         return fused_outputs
 
@@ -276,6 +303,9 @@ class GatedMultiAdapter(ModelMixin):
         idx = 0
         model_path_to_save = save_directory
         for adapter in self.adapters:
+            idx += 1
+            model_path_to_save = save_directory + f"_{idx}"
+
             adapter.save_pretrained(
                 model_path_to_save,
                 is_main_process=is_main_process,
@@ -283,10 +313,6 @@ class GatedMultiAdapter(ModelMixin):
                 safe_serialization=safe_serialization,
                 variant=variant,
             )
-
-            idx += 1
-            model_path_to_save = model_path_to_save + f"_{idx}"
-        
         # Save FiLM + gate MLPs
         film_gate_state = {
             "film_mlps": self.film_mlps.state_dict(),
@@ -388,46 +414,11 @@ class GatedMultiAdapter(ModelMixin):
         multi = cls(adapters, hidden_dim=hidden_dim,enable_film=enable_film)
 
         # >> Load FiLM + gating mlps
-        
-        # >> Load FiLM + gating mlps
         film_gate_path = os.path.join(pretrained_model_path, "pytorch_film_gate.bin")
         if os.path.exists(film_gate_path):
             base_param = next(adapters[0].parameters())
             device = base_param.device
             state = torch.load(film_gate_path, map_location=device)
-
-            # Figure out in_channels and downscale_factor robustly
-            in_ch = getattr(adapters[0].config, "in_channels", None) if hasattr(adapters[0], "config") else None
-            if in_ch is None:
-                in_ch = getattr(adapters[0], "in_channels")
-
-            downscale = getattr(adapters[0].config, "downscale_factor", None) if hasattr(adapters[0], "config") else None
-            if downscale is None:
-                downscale = getattr(adapters[0], "downscale_factor", 16)
-
-            # Use a spatial size that is divisible by downscale_factor
-            dummy_H = downscale
-            dummy_W = downscale
-            dummy_timestep = torch.tensor(1)
-            dummy = torch.zeros(
-                1,
-                in_ch,
-                dummy_H,
-                dummy_W,
-                device=device,
-                dtype=adapters[0].dtype,
-            )
-
-            # FiLM/MLP 的结构依赖于 C_k（实际 feature channel 数）
-            # C_k 必须在 adapter_outputs[i][k] 经过一次前向推理后才能确定
-            # Must initialize MLPs shape → run a dummy forward
-            # We need adapter_outputs[k].shape to infer C_k
-            # dummy = torch.zeros(1, multi.num_adapter * adapters[0].in_channels, 8, 8)
-            # dummy_timestep = torch.tensor(1)
-            # _ = multi(dummy, dummy_timestep)   # this triggers MLP init
-            dummy_list = [dummy for _ in range(multi.num_adapter)]
-            with torch.no_grad():
-                _ = multi.forward(dummy_list,dummy_timestep)  # this triggers _init_mlps_from_features
 
             multi.film_mlps.load_state_dict(state["film_mlps"])
             multi.gate_mlps.load_state_dict(state["gate_mlps"])
@@ -491,7 +482,7 @@ class GatedMultiAdapter1(ModelMixin):
         self.hidden_dim = hidden_dim
         self.film_mlps = nn.ModuleList()  # len = num_scales (default = 4 len of channels) channels: List[int] = [320, 640, 1280, 1280], seen in T2I-adapter
         self.gate_mlps = nn.ModuleList()
-        self._mlp_inited = False
+        self._init_mlps_from_features()
     
     def _init_mlps_from_features(self, adapter_outputs):
         first_adapter_feats = adapter_outputs[0]  # list of 4 scales
