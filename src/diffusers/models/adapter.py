@@ -20,6 +20,7 @@ import torch.nn as nn
 from ..configuration_utils import ConfigMixin, register_to_config
 from ..utils import logging
 from .modeling_utils import ModelMixin
+import json
 
 
 logger = logging.get_logger(__name__)
@@ -254,6 +255,9 @@ class GatedMultiAdapter(ModelMixin):
         idx = 0
         model_path_to_save = save_directory
         for adapter in self.adapters:
+            idx += 1
+            model_path_to_save = save_directory + f"_{idx}"
+
             adapter.save_pretrained(
                 model_path_to_save,
                 is_main_process=is_main_process,
@@ -261,9 +265,6 @@ class GatedMultiAdapter(ModelMixin):
                 safe_serialization=safe_serialization,
                 variant=variant,
             )
-
-            idx += 1
-            model_path_to_save = model_path_to_save + f"_{idx}"
         
         # Save FiLM + gate MLPs
         film_gate_state = {
@@ -330,13 +331,13 @@ class GatedMultiAdapter(ModelMixin):
                 installed. If `True`, the model will be forcibly loaded from`safetensors` weights. If `False`,
                 `safetensors` is not used.
         """
-        idx = 0
+        idx = 1
         adapters = []
 
         # load adapter and append to list until no adapter directory exists anymore
         # first adapter has to be saved under `./mydirectory/adapter` to be compliant with `DiffusionPipeline.from_pretrained`
         # second, third, ... adapters have to be saved under `./mydirectory/adapter_1`, `./mydirectory/adapter_2`, ...
-        model_path_to_load = pretrained_model_path
+        model_path_to_load = pretrained_model_path + f"_{idx}"
         while os.path.isdir(model_path_to_load):
             adapter = T2IAdapter.from_pretrained(model_path_to_load, **kwargs)
             adapters.append(adapter)
@@ -365,16 +366,42 @@ class GatedMultiAdapter(ModelMixin):
         # >> Load FiLM + gating mlps
         film_gate_path = os.path.join(pretrained_model_path, "pytorch_film_gate.bin")
         if os.path.exists(film_gate_path):
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            base_param = next(adapters[0].parameters())
+            device = base_param.device
             state = torch.load(film_gate_path, map_location=device)
+
+            # Figure out in_channels and downscale_factor robustly
+            in_ch = getattr(adapters[0].config, "in_channels", None) if hasattr(adapters[0], "config") else None
+            if in_ch is None:
+                in_ch = getattr(adapters[0], "in_channels")
+
+            downscale = getattr(adapters[0].config, "downscale_factor", None) if hasattr(adapters[0], "config") else None
+            if downscale is None:
+                downscale = getattr(adapters[0], "downscale_factor", 16)
+
+            # Use a spatial size that is divisible by downscale_factor
+            dummy_H = downscale
+            dummy_W = downscale
+
+            dummy = torch.zeros(
+                1,
+                in_ch,
+                dummy_H,
+                dummy_W,
+                device=device,
+                dtype=adapters[0].dtype,
+            )
 
             # FiLM/MLP 的结构依赖于 C_k（实际 feature channel 数）
             # C_k 必须在 adapter_outputs[i][k] 经过一次前向推理后才能确定
             # Must initialize MLPs shape → run a dummy forward
             # We need adapter_outputs[k].shape to infer C_k
-            dummy = torch.zeros(1, multi.num_adapter * adapters[0].in_channels, 8, 8)
-            dummy_timestep = torch.tensor(1)
-            _ = multi(dummy, dummy_timestep)   # this triggers MLP init
+            # dummy = torch.zeros(1, multi.num_adapter * adapters[0].in_channels, 8, 8)
+            # dummy_timestep = torch.tensor(1)
+            # _ = multi(dummy, dummy_timestep)   # this triggers MLP init
+            dummy_list = [dummy for _ in range(multi.num_adapter)]
+            with torch.no_grad():
+                _ = multi.forward_static(dummy_list)  # this triggers _init_mlps_from_features
 
             multi.film_mlps.load_state_dict(state["film_mlps"])
             multi.gate_mlps.load_state_dict(state["gate_mlps"])

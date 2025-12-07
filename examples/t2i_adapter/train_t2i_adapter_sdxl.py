@@ -519,7 +519,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--conditioning_image_column",
         type=str,
-        default="conditioning_image",
+        default=None,
         help="The column of the dataset containing the adapter conditioning image.",
     )
     parser.add_argument(
@@ -669,7 +669,8 @@ def get_train_dataset(args, accelerator):
 
     # Preprocessing the datasets.
     # We need to tokenize inputs and targets.
-    column_names = dataset["train"].column_names
+    column_names = dataset["val"].column_names
+    print(column_names)
 
     # 6. Get the column names for input/target.
     if args.image_column is None:
@@ -717,7 +718,7 @@ def get_train_dataset(args, accelerator):
             )
 
     with accelerator.main_process_first():
-        train_dataset = dataset["train"].shuffle(seed=args.seed)
+        train_dataset = dataset["val"].shuffle(seed=args.seed)
         if args.max_train_samples is not None:
             train_dataset = train_dataset.select(range(args.max_train_samples))
     return train_dataset
@@ -1001,8 +1002,8 @@ def main(args):
                 load_dir = os.path.join(input_dir, "t2iadapter")
                 load_model = type(model).from_pretrained(load_dir)
 
-                if args.control_type != "style":
-                    model.register_to_config(**load_model.config)
+                # if args.control_type != "style":
+                #     model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
                 del load_model
@@ -1105,7 +1106,7 @@ def main(args):
             dummy_H,
             dummy_W,
             device=accelerator.device,
-            dtype=weight_dtype,
+            dtype=next(t2iadapter.parameters()).dtype,
         )
         # one dummy input per adapter
         dummy_list = [dummy for _ in range(t2iadapter.num_adapter)]
@@ -1355,11 +1356,24 @@ def main(args):
                 ]
 
                 # Predict the noise residual
+                # Ensure text embeddings & added conds match UNet dtype (weight_dtype)
+                encoder_hidden_states = batch["prompt_ids"].to(
+                    device=inp_noisy_latents.device, dtype=weight_dtype
+                )
+
+                added_cond_kwargs = {}
+                for k, v in batch["unet_added_conditions"].items():
+                    if isinstance(v, torch.Tensor):
+                        added_cond_kwargs[k] = v.to(device=inp_noisy_latents.device, dtype=weight_dtype)
+                    else:
+                        added_cond_kwargs[k] = v  # just in case there are non-tensor entries
+
+                # Predict the noise residual
                 model_pred = unet(
                     inp_noisy_latents,
                     timesteps,
-                    encoder_hidden_states=batch["prompt_ids"],
-                    added_cond_kwargs=batch["unet_added_conditions"],
+                    encoder_hidden_states=encoder_hidden_states,
+                    added_cond_kwargs=added_cond_kwargs,
                     down_block_additional_residuals=down_block_additional_residuals,
                     return_dict=False,
                 )[0]
@@ -1426,7 +1440,7 @@ def main(args):
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-                    if args.validation_prompt is not None and global_step % args.validation_steps == 0:
+                    if args.validation_prompt is not None and global_step % args.validation_steps == 0 and False:
                         image_logs = log_validation(
                             vae,
                             unet,
@@ -1448,7 +1462,8 @@ def main(args):
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         t2iadapter = unwrap_model(t2iadapter)
-        t2iadapter.save_pretrained(args.output_dir)
+        sub_dir = "t2iadapter"
+        t2iadapter.save_pretrained(os.path.join(args.output_dir, sub_dir))
 
         if args.push_to_hub:
             save_model_card(
