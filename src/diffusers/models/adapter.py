@@ -244,10 +244,10 @@ class GatedMultiAdapter(ModelMixin):
             alpha_k = torch.softmax(gate_logits_k, dim=1)  # (B, num_adapter)
 
             # ----- DEBUG PRINT GATE WEIGHTS -----
-            if (not self.training) or (torch.rand(1).item() < 0.1):
-                t_int = int(timestep[0].item()) if timestep.dim() > 0 else int(timestep.item())
-                weights = alpha_k[0].detach().cpu().numpy().tolist()
-                print(f"[GATE] t={t_int}, scale={k}, weights={weights}, sum={sum(weights):.4f}")
+            # if (not self.training) or (torch.rand(1).item() < 0.1):
+            #     t_int = int(timestep[0].item()) if timestep.dim() > 0 else int(timestep.item())
+            #     weights = alpha_k[0].detach().cpu().numpy().tolist()
+            #     print(f"[GATE] t={t_int}, scale={k}, weights={weights}, sum={sum(weights):.4f}")
             # ------------------------------------
             all_weights.append(alpha_k.detach().cpu())
 

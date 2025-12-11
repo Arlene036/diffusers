@@ -1242,35 +1242,7 @@ class StableDiffusionXLAdapterPipeline(
                         down_intrablock_additional_residuals = [state.clone() for state in adapter_state]
                     else:
                         adapter_state = self.adapter(adapter_input, t)
-                        # # ---------------- DEBUG: save images and weights for specific timesteps ----------------
-                        # debug_steps = {5 * adapter_conditioning_factor -1, 10* adapter_conditioning_factor -1, 15* adapter_conditioning_factor -1, 30* adapter_conditioning_factor -1}
-
-                        # if i in debug_steps:
-                        #     import os
-                        #     t_int = (i + 1) // adapter_conditioning_factor
-                        #     base_dir = f"/home/ubuntu/GMA_inference_output/{save_id}/{t_int}"
-                        #     os.makedirs(base_dir, exist_ok=True)
-                            
-                        #     # 1) 取当前 gate 权重（你需要在 GatedMultiAdapter.forward 里存 last_gate_weights）
-                        #     if hasattr(self.adapter, "last_gate_weights"):
-                        #         gate_w = self.adapter.last_gate_weights  # shape (num_scales, num_adapter)
-                        #         print(f"[DEBUG] t={t_int}, gate weights = {gate_w}")
-                                
-                        #         # 保存到文件
-                        #         with open(f"/home/ubuntu/GMA_inference_output/{save_id}/{t_int}/gate_weights_t.txt", "w") as f:
-                        #             f.write(f"t={t_int}\n")
-                        #             f.write(str(gate_w))
-
-                        #     # 2) 保存当前 latent -> image（vae decode）
-                        #     with torch.no_grad():
-                        #         curr_latent = latents / self.vae.config.scaling_factor
-                        #         img = self.vae.decode(curr_latent, return_dict=False)[0]
-                        #         img = self.image_processor.postprocess(img, output_type="pil")[0]
-                        #         img.save(f"/home/ubuntu/GMA_inference_output/{save_id}/{t_int}/{save_id}.png")
-
-                        #     print(f"[DEBUG] Saved image and weights at t={t_int}")
-                        # # --------------------------------------------------------------------
-
+                       
                         if num_images_per_prompt > 1:
                             for k, v in enumerate(adapter_state):
                                 adapter_state[k] = v.repeat(num_images_per_prompt, 1, 1, 1)
