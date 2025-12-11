@@ -35,7 +35,7 @@ ds = load_dataset("hengyiqun/10623-project-coco17", split="val[4500:]")
 # 1. Load trained GatedMultiAdapter
 # -----------------------------
 adapters = GatedMultiAdapter.from_pretrained(
-    "/home/ubuntu/gate-your-sketch-training_output/sdxl_GMA_withFiLM_t1.0_res512_lr1e-7_bs1x4_seed42_step2000/t2iadapter",
+    "/home/ubuntu/gate-your-sketch-training_output/sdxl_GMA_withFiLM_t1.0_res512_lr1e-7_bs4x4_seed42_step10000/t2iadapter",
     torch_dtype=torch.float16,
 )
 
@@ -50,12 +50,9 @@ model_id, vae=vae, adapter=adapters, scheduler=euler_a, torch_dtype=torch.float1
 
 import io
 
-output_dir = "/home/ubuntu/GMA_inference_outputs"
+output_dir = "/home/ubuntu/GMA_inference_outputs_step10000"
 
 os.makedirs(output_dir, exist_ok = True)
-os.makedirs(output_dir+'/t5', exist_ok = True)
-os.makedirs(output_dir+'/t10', exist_ok = True)
-os.makedirs(output_dir+'/t15', exist_ok = True)
 os.makedirs(output_dir+'/t30', exist_ok = True)
 
 # --------------------------
@@ -63,8 +60,6 @@ os.makedirs(output_dir+'/t30', exist_ok = True)
 # --------------------------
 negative_prompt = "anime, cartoon, graphic, text, painting, crayon, graphite, abstract, glitch, deformed, mutated, ugly, disfigured"
 for idx, item in tqdm(enumerate(ds), total=len(ds)):
-    if idx <= 46:
-        continue
     # item = {'image_id': 521601, 'text': "A small doughnut inside a cup that's sitting on a table.", 'image': <PIL.JpegImagePlugin.JpegImageFile image mode=RGB size=640x480 at 0x799D7244B260>, 'sketch': <PIL.PngImagePlugin.PngImageFile image mode=RGB size=1344x1024 at 0x799D724480B0>, 'depth': <PIL.PngImagePlugin.PngImageFile image mode=L size=1408x1024 at 0x799D724486E0>}
 
     sketch_img = item["sketch"].convert("RGB")
