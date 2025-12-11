@@ -68,7 +68,7 @@ check_min_version("0.36.0.dev0")
 logger = get_logger(__name__)
 
 model_id = 'stabilityai/stable-diffusion-xl-base-1.0'
-scheduler = EulerAncestralDiscreteScheduler.from_pretrained(model_id, subfolder="scheduler")
+scheduler = EulerDiscreteScheduler.from_pretrained(model_id, subfolder="scheduler")
 
 def image_grid(imgs, rows, cols):
     assert len(imgs) == rows * cols
@@ -80,124 +80,34 @@ def image_grid(imgs, rows, cols):
         grid.paste(img, box=(i % cols * w, i // cols * h))
     return grid
 
-
-def log_validation0(vae, unet, adapter, args, accelerator, weight_dtype, step):
-    logger.info("Running validation... ")
-
-    # adapter = accelerator.unwrap_model(adapter)
-
-    pipeline = StableDiffusionXLAdapterPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        vae=vae,
-        unet=unet,
-        adapter=adapter,
-        revision=args.revision,
-        variant=args.variant,
-        torch_dtype=weight_dtype,
-    )
-    pipeline = pipeline.to(accelerator.device)
-    pipeline.set_progress_bar_config(disable=True)
-
-    if args.enable_xformers_memory_efficient_attention:
-        pipeline.enable_xformers_memory_efficient_attention()
-
-    if args.seed is None:
-        generator = None
-    else:
-        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
-
-    if len(args.validation_image) == len(args.validation_prompt):
-        validation_images = args.validation_image
-        validation_prompts = args.validation_prompt
-    elif len(args.validation_image) == 1:
-        validation_images = args.validation_image * len(args.validation_prompt)
-        validation_prompts = args.validation_prompt
-    elif len(args.validation_prompt) == 1:
-        validation_images = args.validation_image
-        validation_prompts = args.validation_prompt * len(args.validation_image)
-    else:
-        raise ValueError(
-            "number of `args.validation_image` and `args.validation_prompt` should be checked in `parse_args`"
-        )
-
-    image_logs = []
-
-    for validation_prompt, validation_image in zip(validation_prompts, validation_images):
-        validation_image = Image.open(validation_image).convert("RGB")
-        validation_image = validation_image.resize((args.resolution, args.resolution))
-
-        images = []
-
-        for _ in range(args.num_validation_images):
-            with torch.autocast("cuda"):
-                image = pipeline(
-                    prompt=validation_prompt, image=validation_image, num_inference_steps=20, generator=generator
-                ).images[0]
-            images.append(image)
-
-        image_logs.append(
-            {"validation_image": validation_image, "images": images, "validation_prompt": validation_prompt}
-        )
-
-    for tracker in accelerator.trackers:
-        if tracker.name == "tensorboard":
-            for log in image_logs:
-                images = log["images"]
-                validation_prompt = log["validation_prompt"]
-                validation_image = log["validation_image"]
-
-                formatted_images = [np.asarray(validation_image)]
-
-                for image in images:
-                    formatted_images.append(np.asarray(image))
-
-                formatted_images = np.stack(formatted_images)
-
-                tracker.writer.add_images(validation_prompt, formatted_images, step, dataformats="NHWC")
-        elif tracker.name == "wandb":
-            formatted_images = []
-
-            for log in image_logs:
-                images = log["images"]
-                validation_prompt = log["validation_prompt"]
-                validation_image = log["validation_image"]
-
-                formatted_images.append(wandb.Image(validation_image, caption="adapter conditioning"))
-
-        else:
-            logger.warning(f"image logging not implemented for {tracker.name}")
-
-        del pipeline
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        return image_logs
-
-def log_validation(vae, unet, adapter, args, accelerator, weight_dtype, step, val_dataset):
+def log_validation(global_step, vae, unet, adapter, args, accelerator, weight_dtype, step, val_dataset, text_encoder_one, text_encoder_two, tokenizer_one,tokenizer_two ):
     logger.info("Running validation... ")
     negative_prompt = "anime, cartoon, graphic, text, painting, crayon, graphite, abstract, glitch, deformed, mutated, ugly, disfigured"
 
     adapter_for_val = accelerator.unwrap_model(adapter)
-    adapter_for_val = adapter_for_val.to(accelerator.device, dtype=weight_dtype)
-    pipeline = StableDiffusionXLAdapterPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        vae=vae,
-        unet=unet,
-        scheduler=scheduler,
+    adapter_for_val = adapter_for_val.to(accelerator.device)
+
+    unet_for_val = accelerator.unwrap_model(unet)
+    unet_for_val = unet_for_val.to(accelerator.device)
+
+    vae_for_val = accelerator.unwrap_model(vae)
+    vae_for_val = vae_for_val.to(accelerator.device)
+
+    pipeline = StableDiffusionXLAdapterPipeline(
+        vae=vae_for_val,
+        unet=unet_for_val,
         adapter=adapter_for_val,
-        revision=args.revision,
-        variant="fp16",
-        torch_dtype=weight_dtype, # fp16
+        scheduler=scheduler,
+        tokenizer=tokenizer_one,
+        tokenizer_2=tokenizer_two,
+        text_encoder=text_encoder_one,
+        text_encoder_2=text_encoder_two
     ).to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
 
     if args.enable_xformers_memory_efficient_attention:
         pipeline.enable_xformers_memory_efficient_attention()
 
-    # ------------------------------
-    # 使用 dataset，而不是 args.validation_image
-    # 取前 N 个样本作为 validation demo
-    # ------------------------------
     num_samples = min(4, len(val_dataset))
 
     image_logs = []
@@ -219,51 +129,43 @@ def log_validation(vae, unet, adapter, args, accelerator, weight_dtype, step, va
             "samples": {}
         }
 
-        # ----------------------------
-        #  对每个 timestep 生成图
-        # ----------------------------
-        for t in args.validation_timesteps:
-            timestep_images = []
-            
-            with torch.no_grad():
-                out = pipeline(
-                    prompt=prompt,
-                    negative_prompt=negative_prompt,
-                    image=[depth, sketch], # [sketch, depth],
-                    num_inference_steps=t,
-                    guidance_scale=7.5,
-                ).images[0]
+        if args.seed is None:
+            generator = None
+        else:
+            generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
-            timestep_images.append(wandb.Image(out, caption=f"t={t}"))
+        with torch.no_grad(), accelerator.autocast():
+            out = pipeline(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                image=[depth, sketch],
+                num_inference_steps=20,
+                guidance_scale=7.5,
+                generator=generator
+            ).images[0]
 
-            result_entry["samples"][f"timestep_{t}"] = timestep_images
+
+            result_entry["samples"] = out
 
         image_logs.append(result_entry)
-
-    # ---------------------------------
-    # 🔥 WandB logging（最小改动）
-    # ---------------------------------
+        
     for tracker in accelerator.trackers:
         if tracker.name == "wandb":
             wandb_logs = {}
 
             for log in image_logs:
+                key = f"val/samples"
+                if key not in wandb_logs:
+                    wandb_logs[key] = []
+                wandb_logs[key].append(wandb.Image(log["samples"], caption=log["prompt"]))
 
-                # Merge outputs by timestep
-                for t_key, images in log["samples"].items():
-                    key = f"val/{t_key}"
-                    if key not in wandb_logs:
-                        wandb_logs[key] = []
-                    wandb_logs[key].extend(images)
-
-                # Add conditioning images
                 for cond_key in ["conditioning_original", "conditioning_sketch", "conditioning_depth"]:
                     key = f"val/{cond_key}"
                     if key not in wandb_logs:
                         wandb_logs[key] = []
                     wandb_logs[key].append(log[cond_key])
 
-            tracker.log(wandb_logs)
+            tracker.log(wandb_logs, global_step)
 
     del pipeline
     gc.collect()
@@ -1194,6 +1096,95 @@ def main(args):
         model = model._orig_mod if is_compiled_module(model) else model
         return model
 
+    def compute_loss(args, batch, vae, unet, t2iadapter, noise_scheduler, weight_dtype, mode="train"):
+        
+        if mode != "train":
+            device = vae.device
+
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    batch[k] = v.to(device)
+                elif isinstance(v, dict):
+                    batch[k] = {kk: (vv.to(device) if isinstance(vv, torch.Tensor) else vv)
+                                for kk, vv in v.items()}
+
+        if args.pretrained_vae_model_name_or_path is not None:
+            pixel_values = batch["pixel_values"].to(dtype=weight_dtype)
+        else:
+            pixel_values = batch["pixel_values"].to(dtype=torch.float16)
+        
+        latents = []
+        for i in range(0, pixel_values.shape[0], 8):
+            latents.append(vae.encode(pixel_values[i : i + 8]).latent_dist.sample())
+        latents = torch.cat(latents, dim=0)
+        latents = latents * vae.config.scaling_factor
+        if args.pretrained_vae_model_name_or_path is None:
+            latents = latents.to(weight_dtype)
+        
+        noise = torch.randn_like(latents)
+        bsz = latents.shape[0]
+
+        timesteps = torch.rand((bsz,), device=latents.device)
+        timesteps = (1 - timesteps**3) * noise_scheduler.config.num_train_timesteps
+        timesteps = timesteps.long().to(noise_scheduler.timesteps.dtype)
+        timesteps = timesteps.clamp(0, noise_scheduler.config.num_train_timesteps - 1)
+
+        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+        
+        sigmas = get_sigmas(timesteps, len(noisy_latents.shape), noisy_latents.dtype)
+        inp_noisy_latents = noisy_latents / ((sigmas**2 + 1) ** 0.5)
+
+        if isinstance(t2iadapter, GatedMultiAdapter):
+            sketch = batch["conditioning_sketch_pixel_values"].to(dtype=weight_dtype)
+            depth = batch["conditioning_depth_pixel_values"].to(dtype=weight_dtype)
+            adapter_inputs = [sketch, depth]
+            down_block_additional_residuals = t2iadapter(adapter_inputs, timesteps)
+        else:
+            t2iadapter_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
+            down_block_additional_residuals = t2iadapter(t2iadapter_image)
+
+        down_block_additional_residuals = [
+            sample.to(dtype=weight_dtype) for sample in down_block_additional_residuals
+        ]
+
+        encoder_hidden_states = batch["prompt_ids"].to(
+                device=inp_noisy_latents.device, dtype=weight_dtype
+        )
+
+        added_cond_kwargs = {}
+        for k, v in batch["unet_added_conditions"].items():
+            if isinstance(v, torch.Tensor):
+                added_cond_kwargs[k] = v.to(device=inp_noisy_latents.device, dtype=weight_dtype)
+            else:
+                added_cond_kwargs[k] = v  # just in case there are non-tensor entries
+
+        model_pred = unet(
+                inp_noisy_latents,
+                timesteps,
+                encoder_hidden_states=encoder_hidden_states,
+                added_cond_kwargs=added_cond_kwargs,
+                down_block_additional_residuals=down_block_additional_residuals,
+                return_dict=False,
+            )[0]
+
+        denoised_latents = model_pred * (-sigmas) + noisy_latents
+        weighing = sigmas**-2.0
+
+        # Get the target for loss depending on the prediction type
+        if noise_scheduler.config.prediction_type == "epsilon":
+            target = latents  # we are computing loss against denoise latents
+        elif noise_scheduler.config.prediction_type == "v_prediction":
+            target = noise_scheduler.get_velocity(latents, noise, timesteps)
+        else:
+            raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+
+        loss = torch.mean(
+                (weighing.float() * (denoised_latents.float() - target.float()) ** 2).reshape(target.shape[0], -1),
+                dim=1,
+            )
+        loss = loss.mean()
+        return loss
+
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
 
@@ -1473,100 +1464,100 @@ def main(args):
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(t2iadapter):
-                if args.pretrained_vae_model_name_or_path is not None:
-                    pixel_values = batch["pixel_values"].to(dtype=weight_dtype)
-                else:
-                    pixel_values = batch["pixel_values"].to(dtype=torch.float16)
+                # if args.pretrained_vae_model_name_or_path is not None:
+                #     pixel_values = batch["pixel_values"].to(dtype=weight_dtype)
+                # else:
+                #     pixel_values = batch["pixel_values"].to(dtype=torch.float16)
 
-                # encode pixel values with batch size of at most 8 to avoid OOM
-                latents = []
-                for i in range(0, pixel_values.shape[0], 8):
-                    latents.append(vae.encode(pixel_values[i : i + 8]).latent_dist.sample())
-                latents = torch.cat(latents, dim=0)
-                latents = latents * vae.config.scaling_factor
-                if args.pretrained_vae_model_name_or_path is None:
-                    latents = latents.to(weight_dtype)
+                # # encode pixel values with batch size of at most 8 to avoid OOM
+                # latents = []
+                # for i in range(0, pixel_values.shape[0], 8):
+                #     latents.append(vae.encode(pixel_values[i : i + 8]).latent_dist.sample())
+                # latents = torch.cat(latents, dim=0)
+                # latents = latents * vae.config.scaling_factor
+                # if args.pretrained_vae_model_name_or_path is None:
+                #     latents = latents.to(weight_dtype)
 
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
-                bsz = latents.shape[0]
+                # # Sample noise that we'll add to the latents
+                # noise = torch.randn_like(latents)
+                # bsz = latents.shape[0]
 
-                # Cubic sampling to sample a random timestep for each image.
-                # For more details about why cubic sampling is used, refer to section 3.4 of https://huggingface.co/papers/2302.08453
-                timesteps = torch.rand((bsz,), device=latents.device)
-                timesteps = (1 - timesteps**3) * noise_scheduler.config.num_train_timesteps
-                timesteps = timesteps.long().to(noise_scheduler.timesteps.dtype)
-                timesteps = timesteps.clamp(0, noise_scheduler.config.num_train_timesteps - 1)
+                # # Cubic sampling to sample a random timestep for each image.
+                # # For more details about why cubic sampling is used, refer to section 3.4 of https://huggingface.co/papers/2302.08453
+                # timesteps = torch.rand((bsz,), device=latents.device)
+                # timesteps = (1 - timesteps**3) * noise_scheduler.config.num_train_timesteps
+                # timesteps = timesteps.long().to(noise_scheduler.timesteps.dtype)
+                # timesteps = timesteps.clamp(0, noise_scheduler.config.num_train_timesteps - 1)
 
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                # # Add noise to the latents according to the noise magnitude at each timestep
+                # # (this is the forward diffusion process)
+                # noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-                # Scale the noisy latents for the UNet
-                sigmas = get_sigmas(timesteps, len(noisy_latents.shape), noisy_latents.dtype)
-                inp_noisy_latents = noisy_latents / ((sigmas**2 + 1) ** 0.5)
+                # # Scale the noisy latents for the UNet
+                # sigmas = get_sigmas(timesteps, len(noisy_latents.shape), noisy_latents.dtype)
+                # inp_noisy_latents = noisy_latents / ((sigmas**2 + 1) ** 0.5)
 
-                # Adapter conditioning.
-                if isinstance(t2iadapter, GatedMultiAdapter):
-                    sketch = batch["conditioning_sketch_pixel_values"].to(dtype=weight_dtype)
-                    depth = batch["conditioning_depth_pixel_values"].to(dtype=weight_dtype)
-                    adapter_inputs = [sketch, depth]
-                    down_block_additional_residuals = t2iadapter(adapter_inputs, timesteps)
-                else:
-                    t2iadapter_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
-                    down_block_additional_residuals = t2iadapter(t2iadapter_image)
+                # # Adapter conditioning.
+                # if isinstance(t2iadapter, GatedMultiAdapter):
+                #     sketch = batch["conditioning_sketch_pixel_values"].to(dtype=weight_dtype)
+                #     depth = batch["conditioning_depth_pixel_values"].to(dtype=weight_dtype)
+                #     adapter_inputs = [sketch, depth]
+                #     down_block_additional_residuals = t2iadapter(adapter_inputs, timesteps)
+                # else:
+                #     t2iadapter_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
+                #     down_block_additional_residuals = t2iadapter(t2iadapter_image)
 
-                down_block_additional_residuals = [
-                    sample.to(dtype=weight_dtype) for sample in down_block_additional_residuals
-                ]
+                # down_block_additional_residuals = [
+                #     sample.to(dtype=weight_dtype) for sample in down_block_additional_residuals
+                # ]
 
-                if accelerator.is_main_process and global_step == 0 and isinstance(t2iadapter, GatedMultiAdapter):
-                    req_grads = [res.requires_grad for res in down_block_additional_residuals]
-                    logger.info(f"down_block_additional_residuals.requires_grad per scale: {req_grads}")
+                # if accelerator.is_main_process and global_step == 0 and isinstance(t2iadapter, GatedMultiAdapter):
+                #     req_grads = [res.requires_grad for res in down_block_additional_residuals]
+                #     logger.info(f"down_block_additional_residuals.requires_grad per scale: {req_grads}")
 
 
-                # Predict the noise residual
-                # Ensure text embeddings & added conds match UNet dtype (weight_dtype)
-                encoder_hidden_states = batch["prompt_ids"].to(
-                    device=inp_noisy_latents.device, dtype=weight_dtype
-                )
+                # # Predict the noise residual
+                # # Ensure text embeddings & added conds match UNet dtype (weight_dtype)
+                # encoder_hidden_states = batch["prompt_ids"].to(
+                #     device=inp_noisy_latents.device, dtype=weight_dtype
+                # )
 
-                added_cond_kwargs = {}
-                for k, v in batch["unet_added_conditions"].items():
-                    if isinstance(v, torch.Tensor):
-                        added_cond_kwargs[k] = v.to(device=inp_noisy_latents.device, dtype=weight_dtype)
-                    else:
-                        added_cond_kwargs[k] = v  # just in case there are non-tensor entries
+                # added_cond_kwargs = {}
+                # for k, v in batch["unet_added_conditions"].items():
+                #     if isinstance(v, torch.Tensor):
+                #         added_cond_kwargs[k] = v.to(device=inp_noisy_latents.device, dtype=weight_dtype)
+                #     else:
+                #         added_cond_kwargs[k] = v  # just in case there are non-tensor entries
 
-                # Predict the noise residual
-                model_pred = unet(
-                    inp_noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=encoder_hidden_states,
-                    added_cond_kwargs=added_cond_kwargs,
-                    down_block_additional_residuals=down_block_additional_residuals,
-                    return_dict=False,
-                )[0]
+                # # Predict the noise residual
+                # model_pred = unet(
+                #     inp_noisy_latents,
+                #     timesteps,
+                #     encoder_hidden_states=encoder_hidden_states,
+                #     added_cond_kwargs=added_cond_kwargs,
+                #     down_block_additional_residuals=down_block_additional_residuals,
+                #     return_dict=False,
+                # )[0]
 
-                # Denoise the latents
-                denoised_latents = model_pred * (-sigmas) + noisy_latents
-                weighing = sigmas**-2.0
+                # # Denoise the latents
+                # denoised_latents = model_pred * (-sigmas) + noisy_latents
+                # weighing = sigmas**-2.0
 
-                # Get the target for loss depending on the prediction type
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = latents  # we are computing loss against denoise latents
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                # # Get the target for loss depending on the prediction type
+                # if noise_scheduler.config.prediction_type == "epsilon":
+                #     target = latents  # we are computing loss against denoise latents
+                # elif noise_scheduler.config.prediction_type == "v_prediction":
+                #     target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                # else:
+                #     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
 
-                # MSE loss
-                loss = torch.mean(
-                    (weighing.float() * (denoised_latents.float() - target.float()) ** 2).reshape(target.shape[0], -1),
-                    dim=1,
-                )
-                loss = loss.mean()
-
+                # # MSE loss
+                # loss = torch.mean(
+                #     (weighing.float() * (denoised_latents.float() - target.float()) ** 2).reshape(target.shape[0], -1),
+                #     dim=1,
+                # )
+                # loss = loss.mean()
+                loss = compute_loss(args, batch, vae, unet, t2iadapter, noise_scheduler, weight_dtype)
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     if isinstance(t2iadapter, GatedMultiAdapter):
@@ -1619,8 +1610,20 @@ def main(args):
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-                    if args.validation_prompt is not None and global_step % args.validation_steps == 0:
+                    if global_step % args.validation_steps == 0:
+                        val_loss_list = []
+                        for i, val_batch in enumerate(val_dataloader):
+                            with torch.no_grad():
+                                val_loss = compute_loss(args, val_batch, vae, unet, t2iadapter, noise_scheduler, weight_dtype, "val")
+                            val_loss_list.append(val_loss.item())
+                            if i >= 5:
+                                break
+                            
+                        avg_val_loss = sum(val_loss_list) / len(val_loss_list)
+                        accelerator.log({"val/loss": avg_val_loss}, step=global_step)
+
                         image_logs = log_validation(
+                            global_step,
                             vae,
                             unet,
                             t2iadapter,
@@ -1628,8 +1631,13 @@ def main(args):
                             accelerator,
                             weight_dtype,
                             global_step,
-                            val_dataset
+                            val_dataset,
+                            text_encoder_one,
+                            text_encoder_two,
+                            tokenizer_one,
+                            tokenizer_two
                         )
+
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
